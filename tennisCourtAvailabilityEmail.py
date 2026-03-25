@@ -3,14 +3,15 @@ from __future__ import annotations
 import os
 import re
 import time
+import ssl
 import smtplib
+import getpass
+import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import requests
 
 
 SCRAPE_CONCURRENCY = 1
@@ -185,14 +186,11 @@ class TennisTowerHamletsClient:
         """Initialize the scraper client."""
         self.retries = retries
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
-        )
+        self.headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
 
     def scrape_venue_for_date(self, venue: VenueConfig, date_iso: str) -> List[Slot]:
         """Fetch and parse all slots for a venue on a given date."""
@@ -201,9 +199,14 @@ class TennisTowerHamletsClient:
 
         for _ in range(self.retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
-                response.raise_for_status()
-                slots = self.parse_slots_from_html(response.text, venue.court_prefix)
+                request = urllib.request.Request(url, headers=self.headers)
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    status_code = getattr(response, "status", 200)
+                    if status_code >= 400:
+                        raise RuntimeError(f"HTTP {status_code} while scraping {url}")
+                    html = response.read().decode("utf-8", errors="replace")
+
+                slots = self.parse_slots_from_html(html, venue.court_prefix)
                 if not slots:
                     raise RuntimeError(f"No slot rows parsed for {venue.id} on {date_iso}")
                 return slots
@@ -321,7 +324,16 @@ class AvailabilityScanner:
 class EmailNotifier:
     """Send availability emails via SMTP."""
 
-    def __init__(self, smtp_host: str, smtp_port: int, username: str, password: str, sender_email: str, recipient_email: str):
+    def __init__(
+        self,
+        smtp_host: str,
+        smtp_port: int,
+        username: str,
+        password: str,
+        sender_email: str,
+        recipient_email: str,
+        use_ssl: bool = False,
+    ):
         """Initialize SMTP email delivery."""
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
@@ -329,6 +341,7 @@ class EmailNotifier:
         self.password = password
         self.sender_email = sender_email
         self.recipient_email = recipient_email
+        self.use_ssl = use_ssl
 
     def send_matches(self, matches: List[AvailabilityMatch]) -> None:
         """Send one email containing all current availability matches."""
@@ -344,10 +357,30 @@ class EmailNotifier:
         msg["To"] = self.recipient_email
         msg.set_content(body)
 
+        if self.use_ssl or self.smtp_port == 465:
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, context=ssl.create_default_context()) as server:
+                self._login_and_send(server, msg)
+            return
+
         with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-            server.starttls()
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+            self._login_and_send(server, msg)
+
+    def _login_and_send(self, server: smtplib.SMTP, msg: EmailMessage) -> None:
+        """Authenticate and send with a clearer error for Gmail auth failures."""
+        try:
             server.login(self.username, self.password)
-            server.send_message(msg)
+        except smtplib.SMTPAuthenticationError as exc:
+            if "gmail" in self.smtp_host.lower():
+                raise RuntimeError(
+                    "Gmail SMTP authentication failed. Use a Google App Password (16 characters) instead of your normal account password, "
+                    "and enable 2-Step Verification on the sender account."
+                ) from exc
+            raise RuntimeError("SMTP authentication failed. Check username/password and SMTP settings.") from exc
+
+        server.send_message(msg)
 
     def _build_body(self, matches: List[AvailabilityMatch]) -> str:
         """Build a readable email body for all matches."""
@@ -422,12 +455,29 @@ class CourtMonitorService:
             print("[INFO] No new matches found")
 
 
-def load_email_notifier(recipient_email: str) -> EmailNotifier:
-    """Create an email notifier from environment variables."""
+def load_email_notifier(
+    recipient_email: str,
+    default_username: Optional[str] = None,
+    default_password: Optional[str] = None,
+) -> EmailNotifier:
+    """Create an email notifier from environment variables with safe fallbacks."""
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_username = os.environ["SMTP_USERNAME"]
-    smtp_password = os.environ["SMTP_PASSWORD"]
+    smtp_use_ssl = os.environ.get("SMTP_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
+    smtp_username = os.environ.get("SMTP_USERNAME") or default_username
+    smtp_password = os.environ.get("SMTP_APP_PASSWORD") or os.environ.get("SMTP_PASSWORD") or default_password
+
+    if not smtp_username:
+        smtp_username = input("SMTP username/email: ").strip()
+
+    if not smtp_password:
+        smtp_password = getpass.getpass("SMTP app password (recommended for Gmail): ")
+
+    if not smtp_username:
+        raise ValueError("SMTP username is required")
+    if not smtp_password:
+        raise ValueError("SMTP password is required")
+
     smtp_sender = os.environ.get("SMTP_SENDER_EMAIL", smtp_username)
 
     return EmailNotifier(
@@ -437,6 +487,7 @@ def load_email_notifier(recipient_email: str) -> EmailNotifier:
         password=smtp_password,
         sender_email=smtp_sender,
         recipient_email=recipient_email,
+        use_ssl=smtp_use_ssl,
     )
 
 
@@ -467,22 +518,48 @@ def build_target_windows(raw_config: Dict[str, List[str]]) -> Dict[str, VenueWin
     return result
 
 
-if __name__ == "__main__":
-    venue_schedule = {
-        "st_johns_park": ["Monday", "18:00", "21:00"],
-        "bethnal_green_gardens": ["Sunday", "10:00", "13:00"],
-        "victoria_park": ["Wednesday", "18:00", "21:00"],
-    }
-
+def run_monitor_with_config(
+    email_address: str,
+    email_password: str,
+    recipient_email: str,
+    refresh_frequency_minutes: int,
+    venue_schedule: Dict[str, List[str]],
+) -> None:
+    """Build and run the monitoring service from user-provided config values."""
     target_windows = build_target_windows(venue_schedule)
     client = TennisTowerHamletsClient(retries=SCRAPE_RETRIES, timeout=REQUEST_TIMEOUT_SECONDS)
     scanner = AvailabilityScanner(client=client, venues=VENUES, concurrency=SCRAPE_CONCURRENCY)
-    notifier = load_email_notifier(recipient_email="lukasd.saulis@gmail.com")
+    notifier = load_email_notifier(
+        recipient_email=recipient_email,
+        default_username=email_address,
+        default_password=email_password,
+    )
     deduplicator = AlertDeduplicator()
     service = CourtMonitorService(
         scanner=scanner,
         notifier=notifier,
         deduplicator=deduplicator,
-        interval_seconds=CHECK_INTERVAL_SECONDS,
+        interval_seconds=refresh_frequency_minutes * 60,
     )
     service.run_forever(target_windows)
+
+
+if __name__ == "__main__":
+    email_address = "wallstreetdegenerate1792@gmail.com"
+    email_password = "LukasSaulis01"
+    recipient_email = email_address
+    refresh_frequency_minutes = 15
+
+    venue_schedule = {
+        "st_johns_park": ["Wednesday", "12:00", "16:00"],
+        "bethnal_green_gardens": ["Sunday", "10:00", "13:00"],
+        "victoria_park": ["Wednesday", "18:00", "21:00"],
+    }
+
+    run_monitor_with_config(
+        email_address=email_address,
+        email_password=email_password,
+        recipient_email=recipient_email,
+        refresh_frequency_minutes=refresh_frequency_minutes,
+        venue_schedule=venue_schedule,
+    )
